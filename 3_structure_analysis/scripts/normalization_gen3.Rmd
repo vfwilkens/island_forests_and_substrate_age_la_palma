@@ -1,0 +1,51 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(lidR)
+library(terra)
+library(future)
+```
+
+```{r}
+LiDAR_normalize <- function(chunk) # user defined function
+{
+  las <- readLAS(chunk)                  # read the chunk
+  if (lidR::is.empty(las)) return(NULL)
+    
+
+  las <- filter_duplicates(las)
+  las <- classify_noise(las, ivf(2,5))
+  las <- filter_poi(las, Classification != LASNOISE)
+  las <- filter_poi(las, Classification != 12)
+
+  dtm <- rasterize_terrain(las, 0.5, tin())
+
+  las <- normalize_height(las, tin(), dtm = dtm) # normalize
+  las <- filter_poi(las, Z < 60)
+  
+  return(las)
+  
+}
+```
+
+```{r}
+nctg <- readLAScatalog("/mnt/NAS/CanaryData/LiDAR/LiDAR_raw/gen3_La_Palma")
+
+plot(nctg)
+print(nctg)
+
+plan(multisession, workers = 16)
+opt_chunk_size(nctg) <- 0
+opt_chunk_buffer(nctg) <- 25
+opt_filter(nctg) <- "-drop_withheld"
+opt_stop_early(nctg) <- FALSE
+#opt_restart(nctg) <- XXX
+
+opt_output_files(nctg) <- paste0("/mnt/NAS/CanaryData/LiDAR/LiDAR_normalized/gen3_El_Hierro_normalized/", "chunk_{XLEFT}_{YBOTTOM}")
+
+output <- catalog_apply(nctg, LiDAR_normalize) 
+```
+

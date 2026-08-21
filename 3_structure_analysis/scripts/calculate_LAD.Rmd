@@ -1,0 +1,209 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(lidR)
+library(terra)
+library(future)
+```
+
+
+```{r}
+voxel_metrics_2 <- function (las, func, res = 1, start = c(0, 0, 0), ..., all_voxels = FALSE) 
+{
+  # Namespace fix: explicit calls to internal lidR functions
+  lidR:::stopifnotlas(las)
+  lidR:::assert_all_are_non_negative(res)
+  lidR:::assert_is_a_bool(all_voxels)
+  
+  # Ensure start is a vector of length 3
+  if (length(start) == 1L) 
+    start <- c(start, start, start)
+  else if (length(start) != 3L) 
+    stop("start must be a vector of length 1 or 3.")
+  
+  if (length(res) == 1L) 
+    res <- c(res, res)
+  else if (length(res) > 2L) 
+    stop("Wrong resolution provided.")
+  
+  .I <- .GRP <- GRP <- NULL
+  
+  # Namespace fix: lidR:::group_grid_3d
+  # Logic fix: Using 'start' parameter
+  by <- lidR:::group_grid_3d(las$X, las$Y, las$Z, res, start)
+  
+  by <- data.table::setDT(by)
+  by <- by[, `:=`(GRP, .GRP), by = c("Xgrid", "Ygrid", "Zgrid")]
+  grp <- by$GRP
+  by <- by[by[, .I[1], by = GRP]$V1]
+  
+  # Namespace fix: lidR:::template_metrics
+  M <- lidR:::template_metrics(las, func, grp, ...)
+  
+  if ("Z" %in% names(M)) 
+    warning("Z is reserved for the coordinates of the voxels and cannot be used as metric name. Metric Z discarded.", 
+            call. = FALSE)
+  
+  M[["X"]] <- by[["Xgrid"]][M[["GRPID"]]]
+  M[["Y"]] <- by[["Ygrid"]][M[["GRPID"]]]
+  M[["Z"]] <- by[["Zgrid"]][M[["GRPID"]]]
+  M[["GRPID"]] <- NULL
+  
+  if (all_voxels) {
+    xrange <- range(M$X)
+    yrange <- range(M$Y)
+    zrange <- range(M$Z)
+    
+    # Namespace fix: lidR:::f_grid
+    # Logic fix: Using 'start' parameter
+    X <- lidR:::f_grid(seq(xrange[1], xrange[2], by = res[1]), res[1], start[1])
+    Y <- lidR:::f_grid(seq(yrange[1], yrange[2], by = res[1]), res[1], start[2])
+    Z <- lidR:::f_grid(seq(zrange[1], zrange[2], by = res[2]), res[2], start[3])
+    
+    all <- expand.grid(X = X, Y = Y, Z = Z)
+    data.table::setDT(all)
+    data.table::setkey(M, X, Y, Z)
+    data.table::setkey(all, X, Y, Z)
+    M <- merge(M, all, all = TRUE)
+  }
+  
+  data.table::setcolorder(M, c("X", "Y", "Z"))
+  data.table::setattr(M, "class", c("lasmetrics3d", attr(M, "class")))
+  data.table::setattr(M, "res", res[1])
+  
+  return(M)
+}
+
+```
+
+
+
+```{r}
+
+#' Calculate Leaf Area Density (LAD) using voxel-based gap frequency
+#'
+#' Uses the Beer-Lambert law to estimate LAD from gap probability within voxels.
+#' LAD = -ln(P_gap) / (k * dz)
+#' where P_gap is the gap probability (ratio of pulses passing through without hits),
+#' k is the extinction coefficient, and dz is the voxel height.
+#'
+#' @param las A LAS object (normalized point cloud)
+#' @param res Horizontal resolution of voxels (default = 1m)
+#' @param dz Vertical resolution/height of voxels (default = 1m)
+#' @param k Extinction coefficient (default = 0.5)
+#' @param z_min Minimum height to consider (default = 0, excludes ground)
+#' @return A SpatRaster where each layer contains LAD for a height level
+calculate_LAD <- function(chunk, res = 10, dz = 2.5, min_z = -2.0, max_z = 50) {
+  las <- readLAS(chunk)
+
+  if (lidR::is.empty(las)) {
+    return(NULL)
+  }
+
+  vox <- voxel_metrics_2(las, ~ list(N = length(Z)), res = c(res, dz), all_voxels = FALSE, start = c(0,0, min_z))
+  
+  xmin_adj <- min(vox$X) - (res / 2)
+  xmax_adj <- max(vox$X) + (res / 2)
+  ymin_adj <- min(vox$Y) - (res / 2)
+  ymax_adj <- max(vox$Y) + (res / 2)
+  template <- rast(
+    xmin = xmin_adj,
+    xmax = xmax_adj,
+    ymin = ymin_adj,
+    ymax = ymax_adj,
+    resolution = res
+  )
+  
+  
+  z_levels <- seq(from = min_z + dz / 2, to = max_z, by = dz)
+  raster_list <- list()
+
+
+  for (z in z_levels) {
+    slice <- vox[vox$Z == z, ]
+    slice <- as.data.frame(slice)
+    if (nrow(slice) > 0) {
+      pts <- vect(slice, geom = c("X", "Y"))
+      r_slice <- rasterize(pts, template, field = "N", background = 0)
+    } else {
+      r_slice <- template
+      values(r_slice) <- 0
+    }
+    names(r_slice) <- paste0("Z_", z)
+    raster_list[[as.character(z)]] <- r_slice
+  }
+
+
+  r <- rast(raster_list)
+  total <- sum(r)
+  result_list <- list()
+  for (i in 1:nlyr(r)) {
+    below <- if (i == 1) 0 else sum(r[[1:(i - 1)]])
+    above <- if (i == nlyr(r)) 0 else sum(r[[(i + 1):nlyr(r)]])
+    result_list[[i]] <- below / (total - above)
+  }
+
+  result_stack <- rast(result_list)
+
+  result_stack <- -log(result_stack) / (0.5 * dz)
+  
+  result_stack <- ifel(is.infinite(result_stack), 0, result_stack)
+  result_stack <- ifel(is.na(result_stack), 0, result_stack)
+
+  names(result_stack) <- paste0("level_", stringr::str_replace(z_levels, "\\.", "_"))
+  
+  return(result_stack)
+  
+}
+
+```
+
+```{r}
+nctg <- readLAScatalog("/mnt/NAS/CanaryData/LiDAR/LiDAR_normalized/gen3_La_Palma_normalized")
+
+plot(nctg)
+
+plan(multisession, workers = 36)
+opt_chunk_size(nctg) <- 0
+opt_chunk_buffer(nctg) <- 0
+opt_filter(nctg) <- "-drop_withheld"
+opt_stop_early(nctg) <- FALSE
+#opt_restart(nctg) <- XXX
+
+
+opt_output_files(nctg) <- paste0("/mnt/NAS/CanaryData/LiDAR/LiDAR_metrics/Canary_Island_Ecosystems/gen3_La_Palma_LAD/", "chunk_{XLEFT}_{YBOTTOM}_voxel")
+
+output <- catalog_apply(nctg, calculate_LAD, res = 10, dz = 2.5, min_z = -2.0, max_z = 50) 
+```
+
+
+```{r}
+input_dir <- "/mnt/NAS/CanaryData/LiDAR/LiDAR_metrics/Canary_Island_Ecosystems/gen3_La_Palma_LAD"
+
+tif_files <- list.files(input_dir, pattern = "\\.tif$", full.names = TRUE)
+
+rast_list <- lapply(tif_files, rast)
+
+merged <- do.call(merge, rast_list)
+plot(merged)
+
+# 1. Define your paths
+network_path <- "/mnt/NAS/CanaryData/LiDAR/LiDAR_metrics/Canary_Island_Ecosystems/gen3_La_Palma_LAD.tif"
+local_temp   <- tempfile(fileext = ".tif") # Or specific path like "~/Desktop/LAD_temp.tif"
+
+# 2. Write the raster to your local disk
+#    (This avoids the "Seek" errors because local disk I/O is fully supported)
+writeRaster(merged, local_temp, overwrite=TRUE)
+
+# 3. Copy the finished file to the network share
+file.copy(from = local_temp, to = network_path, overwrite = TRUE)
+
+# 4. Clean up local file (optional)
+unlink(local_temp)
+
+print("Process complete: File moved to network share.")
+```
+
